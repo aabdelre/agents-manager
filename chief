@@ -1,0 +1,7 @@
+#!/bin/sh
+CHIEF_PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ ! -x "$CHIEF_PROJECT_DIR/.venv/bin/chief" ]; then
+  echo "Run 'uv sync' in $CHIEF_PROJECT_DIR first." >&2
+  exit 1
+fi
+exec "$CHIEF_PROJECT_DIR/.venv/bin/python" "$CHIEF_PROJECT_DIR/src/chief/entry.py" "$@"
