@@ -39,7 +39,7 @@ class Tmux:
     def exists(self, name):
         return self.run("has-session", "-t", "=" + name, check=False).returncode == 0
 
-    def configure(self):
+    def write_config(self):
         nav = shlex.join(self.command("_navigate"))
         # This file belongs only to our separate server; the user's tmux config is untouched.
         config = self.store.home / "tmux.conf"
@@ -48,6 +48,9 @@ class Tmux:
                 [
                     "set -g mouse on",
                     "set -g default-terminal tmux-256color",
+                    "set-environment -gu NO_COLOR",
+                    "set-environment -gu NODE_DISABLE_COLORS",
+                    "set-environment -g COLORTERM truecolor",
                     "set -g status-position bottom",
                     "set -g status-style 'bg=#172335,fg=#9cacc4'",
                     "set -g status-left-length 24",
@@ -75,7 +78,10 @@ class Tmux:
             )
             + "\n"
         )
-        self.run("source-file", str(config))
+        return config
+
+    def configure(self):
+        self.run("source-file", str(self.write_config()))
 
     def ensure(self, name):
         with (self.store.home / "launch.lock").open("a") as lock:
@@ -107,7 +113,7 @@ class Tmux:
             return
         pane = self.run(
             "-f",
-            "/dev/null",
+            str(self.write_config()),
             "new-session",
             "-d",
             "-P",
@@ -150,13 +156,39 @@ class Tmux:
 
     def attach(self, name):
         self.ensure(name)
-        self.store.update(name, attended=1)
         if os.environ.get("TMUX"):
             # A nested client would trap shortcuts and mix servers; a fresh terminal is explicit.
             raise ValueError(
                 "Already inside tmux. Use the sidebar here, or run `chief attach` in a fresh terminal."
             )
         os.execvp("tmux", ["tmux", "-L", self.socket, "attach-session", "-t", name])
+
+    def restart(self, name):
+        """Reload Claude's launcher for an idle conversation without replacing its tmux pane."""
+        with (self.store.home / "launch.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            row = self.store.session(name)
+            if not self.exists(name):
+                self._ensure(name)
+                return
+            if row["state"] not in {"idle", "ready", "exited", "stopped"}:
+                raise ValueError(
+                    f"{name} is {row['state']}; let its current turn or permission prompt finish before restarting."
+                )
+            self.store.update(name, state="starting")
+            try:
+                self.run(
+                    "respawn-pane",
+                    "-k",
+                    "-t",
+                    row["pane"],
+                    "-c",
+                    row["cwd"],
+                    shlex.join(self.command("_run", name)),
+                )
+            except Exception:
+                self.store.update(name, state="exited")
+                raise
 
     def navigate(self, current, target=None, direction=1, client=None):
         sessions = [r["name"] for r in self.store.sessions() if self.exists(r["name"])]
@@ -172,8 +204,6 @@ class Tmux:
             raise ValueError(
                 "Multiple terminals are viewing this session. Use Alt+Left/Right in your terminal."
             )
-        self.store.update(current, attended=1)
-        self.store.update(target, attended=1)
         for destination in clients:
             self.run("switch-client", "-c", destination, "-t", target)
         return target
@@ -183,28 +213,6 @@ class Tmux:
         if not self.exists(name):
             return "Session is offline. Its messages and summary are preserved."
         return self.run("capture-pane", "-p", "-J", "-t", row["pane"], "-S", str(-min(lines, 300)))
-
-    def wake_if_safe(self, name):
-        row = self.store.session(name)
-        if row["state"] != "idle" or row["attended"] or not self.store.inbox(name, pending_only=True):
-            return False
-        if self.attached(name):
-            self.store.update(name, attended=1)
-            return False
-        self.store.update(name, state="waking")
-        self.run(
-            "send-keys",
-            "-t",
-            row["pane"],
-            "-l",
-            "Read your Chief inbox, acknowledge messages, and act on them.",
-        )
-        # Separate commands let Claude's TTY read the text before the submit key.
-        import time
-
-        time.sleep(0.15)
-        self.run("send-keys", "-t", row["pane"], "Enter")
-        return True
 
     def stop(self, name):
         if self.exists(name):

@@ -69,6 +69,7 @@ the sidebar avoids guessing which terminal to switch.
 ./chief todo done 1
 ./chief stop research                      # end process; preserve records
 ./chief start research                     # restart / resume its conversation
+./chief restart research                   # reload an idle session with its saved conversation
 ./chief restore                            # restore all sessions after a reboot
 ```
 
@@ -87,24 +88,26 @@ agents can write concurrently. MCP server identities are bound to their workstre
 cannot use the protocol to impersonate chief or spawn more sessions.
 
 The chief has `spawn`, `send`, `probe`, `inspect`, `list_sessions`, `inbox`, `ack`, `report`,
-`await_updates`, `add_todo`, and `list_todos` tools. Workers have the reporting and inbox tools.
-`await_updates` lets the chief wait up to 30 seconds for incoming reports during coordination.
+`add_todo`, and `list_todos` tools. Workers can `send` messages directly to the chief, report
+progress, acknowledge instructions, and add human action items.
 
-Messages enter Claude through its SessionStart, UserPromptSubmit, PostToolUse, and Stop hooks.
-The Stop hook allows at most one mailbox-triggered continuation, preventing an endless stop
-loop. Unacknowledged messages replay when the conversation resumes. Delivery means the
-instruction was presented to Claude; acknowledgement means it was understood, **not** that
-the work was completed. Reports record outcomes separately.
+An MCP channel pushes messages directly to Claude when another session sends them, including
+when Claude is idle. Agents no longer need you to wake a session or type an inbox-check prompt.
+Claude receives messages in order and the durable inbox remains available as a record.
+Unacknowledged messages replay when the conversation resumes. Delivery means the instruction
+was presented to Claude; acknowledgement means it was understood, **not** that the work was
+completed. Reports record outcomes separately.
 
-Workers are instructed to publish a concise summary, next step, blockers, and human actions.
-If a worker finishes a turn without reporting, the Stop hook sends a bounded **turn-end
-excerpt**, clearly labeled as such. It is not an independently generated summary.
+The custom `server:chief` channel uses Claude Code's local development channel option. Claude
+displays a confirmation at startup for each session. Approving it permits this local bridge
+for that session. Organization policy may still disable channels.
 
-New, unattended workers can wake automatically when idle. Once you open a session, automatic
-typing is disabled for that process to preserve any prompt draft you leave there. Its inbox
-still arrives during tools and at turn boundaries. When an opened session is idle, type
-**“check inbox”** in Claude to process queued instructions. The sidebar instruction field
-queues a durable message; it does not submit the native Claude prompt for you.
+Workers publish a concise report with the summary, next step, blockers, and human actions.
+Acknowledgements do not trigger separate reports, so completion messages do not create a
+reply loop.
+
+Messages arrive through Claude's channel, not by typing into its prompt, so an unfinished
+draft remains intact. The sidebar instruction field queues a message for direct delivery.
 
 Closing a terminal preserves processes in tmux. Rebooting ends those processes; `chief restore`
 recreates them using recorded Claude conversation IDs and `--resume`. Claude's own stored

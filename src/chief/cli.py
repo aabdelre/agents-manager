@@ -37,6 +37,8 @@ def parser():
         "restore", help="Restore all recorded sessions after reboot or tmux shutdown"
     )
     restore.add_argument("--detach", action="store_true")
+    restart = commands.add_parser("restart", help="Reload an idle session with its saved Claude conversation")
+    restart.add_argument("name", nargs="?", default="chief")
     listing = commands.add_parser("list", help="List status and workstream summaries")
     listing.add_argument("--json", action="store_true")
     send = commands.add_parser("send", help="Queue an instruction for a session")
@@ -77,7 +79,10 @@ def parser():
     )
     demo.add_argument("--detach", action="store_true")
     for internal in ("_run", "_sidebar", "_hook", "_mcp"):
-        commands.add_parser(internal, help=argparse.SUPPRESS).add_argument("name")
+        internal_parser = commands.add_parser(internal, help=argparse.SUPPRESS)
+        internal_parser.add_argument("name")
+        if internal in ("_hook", "_mcp"):
+            internal_parser.add_argument("--channel", action="store_true", help=argparse.SUPPRESS)
     nav = commands.add_parser("_navigate", help=argparse.SUPPRESS)
     nav.add_argument("direction", choices=["prev", "next", "click"])
     nav.add_argument("--client")
@@ -165,6 +170,9 @@ def execute(args):
             tmux.ensure(row["name"])
         if not args.detach:
             tmux.attach("chief")
+    elif command == "restart":
+        tmux.restart(args.name)
+        print(f"Restarting {args.name} with its saved Claude conversation.")
     elif command == "demo":
         seed_demo(store)
         for row in store.sessions():
@@ -237,7 +245,7 @@ def execute(args):
 
         try:
             payload = json.load(sys.stdin)
-            result = handle_hook(store, args.name, payload)
+            result = handle_hook(store, args.name, payload, channel=args.channel)
             print(json.dumps(result))
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"Chief hook: {exc}", file=sys.stderr)
@@ -245,7 +253,7 @@ def execute(args):
     elif command == "_mcp":
         from chief.protocol import Protocol
 
-        Protocol(store, args.name).serve()
+        Protocol(store, args.name, channel=args.channel).serve()
     return 0
 
 

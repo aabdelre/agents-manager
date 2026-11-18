@@ -47,6 +47,12 @@ class Store:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS open_todo ON todos(session, text) WHERE done=0;
             """)
+            # Existing desks are upgraded in place. Hook processes may open the same
+            # database concurrently, so schema inspection and migration share a lock.
+            db.execute("BEGIN IMMEDIATE")
+            if "channel_token" not in {r["name"] for r in db.execute("PRAGMA table_info(messages)")}:
+                db.execute("ALTER TABLE messages ADD COLUMN channel_token TEXT")
+            db.execute("COMMIT")
         self.path.chmod(0o600)
 
     @contextmanager
@@ -158,19 +164,28 @@ class Store:
                 )
             ]
 
-    def deliver(self, name, replay=False):
+    def deliver(self, name, replay=False, channel_token=None):
         """Claim a bounded batch once; unacknowledged messages replay on session resume."""
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
+            if channel_token is not None:
+                # Each MCP connection pushes unacknowledged messages once. Reconnects
+                # replay them, even if a previous process died after claiming a batch.
+                predicate = "AND (channel_token IS NULL OR channel_token != ?) "
+                parameters = (name, channel_token)
+            else:
+                predicate = "" if replay else "AND delivered IS NULL "
+                parameters = (name,)
             rows = db.execute(
                 "SELECT * FROM messages WHERE recipient=? AND acked IS NULL "
-                + ("" if replay else "AND delivered IS NULL ")
+                + predicate
                 + "ORDER BY id LIMIT 8",
-                (name,),
+                parameters,
             ).fetchall()
             if rows:
                 db.executemany(
-                    "UPDATE messages SET delivered=? WHERE id=?", [(time.time(), r["id"]) for r in rows]
+                    "UPDATE messages SET delivered=?,channel_token=? WHERE id=?",
+                    [(time.time(), channel_token, r["id"]) for r in rows],
                 )
             db.execute("COMMIT")
         return [dict(r) for r in rows]

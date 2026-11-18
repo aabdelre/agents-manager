@@ -88,7 +88,9 @@ class InboxScreen(ModalScreen):
 
     def compose(self):
         with Vertical(id="mail"):
-            yield Static("[b]INBOX[/b]\nSubmit “check inbox” in Claude to process queued messages.")
+            yield Static(
+                "[b]INBOX[/b]\nMessages prompt Claude automatically. Unacknowledged messages remain here."
+            )
             with VerticalScroll(id="mail-scroll"):
                 if not self.messages:
                     yield Static("All caught up.")
@@ -250,9 +252,7 @@ class Sidebar(App):
             result = self.guarded(lambda: self.store.send("user", self.session_name, event.value))
             if result:
                 event.input.value = ""
-                self.notify(
-                    f"Message #{result} queued. Submit “check inbox” in Claude when ready.", timeout=6
-                )
+                self.notify(f"Message #{result} queued for direct delivery to Claude.", timeout=4)
 
     @on(Button.Pressed)
     def button(self, event):

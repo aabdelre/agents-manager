@@ -6,7 +6,6 @@ import json
 import os
 import shlex
 import subprocess
-import threading
 
 from chief.store import Store
 from chief.tmux import Tmux
@@ -26,6 +25,9 @@ If asked for an update, report your actual progress, including what remains unve
 Use normal Claude tool permissions. Never bypass permissions to keep a workstream moving.
 Separate sessions can share files. Coordinate file ownership; use different directories or
 git worktrees for concurrent edits to the same repository. Do not overwrite another agent's work.
+Messages arrive automatically as <channel source="chief"> events, including while idle.
+Act on their content directly; never ask the user to trigger an inbox check. Use send to
+prompt the other session; report also pushes directly to chief. Acknowledge messages by ID.
 """
     if row["role"] == "chief":
         return (
@@ -36,8 +38,8 @@ matters next. Turn goals into clearly scoped workstreams; use spawn to delegate 
 independent persistent Claude sessions, each with a concrete task and working directory.
 Use send to redirect a workstream, probe to request an update, inspect to see its actual
 terminal, and list_sessions to get the portfolio. Delegate when it serves the user's goal.
-Use await_updates while coordinating active assignments; it waits up to 30 seconds for
-incoming reports without typing into your terminal. Stay responsive to new instructions.
+Incoming reports automatically start a turn. You can finish your response while workers
+are active; you will be prompted when they report. Do not poll or wait in a loop.
 Synthesize reports instead of forwarding walls of text. Flag decisions and blockers, and
 maintain each workstream's human action items. Be calm, candid, proactive, and brief.
 Do not invent activity: distinguish queued instructions, acknowledged messages, and results.
@@ -60,7 +62,7 @@ def prepare(store: Store, name):
     row = store.session(name)
     folder = store.home / "sessions" / name
     folder.mkdir(parents=True, exist_ok=True)
-    hook_command = shlex.join(tmux.command("_hook", name))
+    hook_command = shlex.join(tmux.command("_hook", name, "--channel"))
     events = (
         "SessionStart",
         "UserPromptSubmit",
@@ -79,7 +81,7 @@ def prepare(store: Store, name):
     settings_path = folder / "settings.json"
     settings_path.write_text(json.dumps(settings, indent=2))
     mcp_path = folder / "mcp.json"
-    command = tmux.command("_mcp", name)
+    command = tmux.command("_mcp", name, "--channel")
     mcp_path.write_text(
         json.dumps({"mcpServers": {"chief": {"command": command[0], "args": command[1:]}}}, indent=2)
     )
@@ -95,6 +97,8 @@ def prepare(store: Store, name):
         system_prompt(row),
         "--allowedTools",
         "mcp__chief__*",
+        "--dangerously-load-development-channels",
+        "server:chief",
     ]
     if row["launched"]:
         args += ["--resume", row["claude_id"]]
@@ -107,6 +111,15 @@ def prepare(store: Store, name):
     return args
 
 
+def claude_environment(environ=None):
+    """A real tmux TTY must not inherit the automation host's monochrome settings."""
+    env = dict(os.environ if environ is None else environ)
+    for key in ("CLAUDECODE", "NO_COLOR", "NODE_DISABLE_COLORS"):
+        env.pop(key, None)
+    env.update(TERM="tmux-256color", COLORTERM="truecolor", FORCE_COLOR="3")
+    return env
+
+
 def run_session(store: Store, name):
     row = store.session(name)
     if row["demo"]:
@@ -114,34 +127,18 @@ def run_session(store: Store, name):
 
         DemoTerminal(store, name).run()
         return
-    tmux = Tmux(store)
     args = prepare(store, name)
-    finished = threading.Event()
-
-    def dispatch():
-        while not finished.wait(2):
-            try:
-                if tmux.attached(name):
-                    store.update(name, attended=1)
-                tmux.wake_if_safe(name)
-            except (ValueError, RuntimeError, OSError):
-                # A disappearing pane is normal during stop. Durable messages stay queued.
-                pass
-
-    threading.Thread(target=dispatch, daemon=True).start()
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
+    env = claude_environment()
     env["CHIEF_HOME"] = str(store.home)
     env["CHIEF_SESSION"] = name
     try:
         result = subprocess.run(args, cwd=row["cwd"], env=env, check=False)
         print(f"\nClaude exited ({result.returncode}). Resume with: chief start {name}", flush=True)
     finally:
-        finished.set()
         store.update(name, state="exited")
 
 
-def handle_hook(store: Store, name, payload):
+def handle_hook(store: Store, name, payload, *, channel=False):
     event = payload.get("hook_event_name", "")
     row = store.session(name)
     if event == "SessionStart":
@@ -169,16 +166,14 @@ def handle_hook(store: Store, name, payload):
     elif event == "PostToolUse":
         store.update(name, state="working")
     elif event == "Stop":
-        message = payload.get("last_assistant_message", "").strip()
-        if row["role"] != "chief" and message and row["reported_turn"] != row["turn"]:
-            # Fallback is explicitly an excerpt, not a model-generated summary.
-            summary = message[:900] + ("…" if len(message) > 900 else "")
-            store.update(name, summary=summary, reported_turn=row["turn"])
-            store.send(name, "chief", "Turn-end excerpt: " + summary, "update")
         store.update(name, state="idle")
         if payload.get("stop_hook_active"):
             return {}  # Bound continuation; remaining messages stay queued for the next turn.
     else:
+        return {}
+    if channel:
+        # The MCP push stream owns delivery. Hooks record lifecycle and reports only;
+        # consuming here could steal a message without ever starting an idle turn.
         return {}
     messages = store.deliver(name, replay=event == "SessionStart")
     if not messages:

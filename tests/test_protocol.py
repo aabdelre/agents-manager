@@ -62,7 +62,7 @@ def test_hook_delivery_and_bounded_stop(store):
     store.send("chief", "product", "Later")
     assert handle_hook(store, "product", {"hook_event_name": "Stop", "stop_hook_active": True}) == {}
     assert store.inbox("product", pending_only=True)[0]["body"] == "Later"
-    assert len(store.inbox("chief")) == 1
+    assert store.inbox("chief") == []
 
 
 def test_explicit_report_prevents_duplicate_fallback(store):
@@ -70,6 +70,15 @@ def test_explicit_report_prevents_duplicate_fallback(store):
     store.report("product", "Short summary")
     handle_hook(store, "product", {"hook_event_name": "Stop", "last_assistant_message": "Long answer"})
     assert len(store.inbox("chief")) == 1
+
+
+def test_turn_end_acknowledgement_does_not_create_a_reply_loop(store):
+    handle_hook(store, "product", {"hook_event_name": "UserPromptSubmit"})
+    store.ack("product", [store.send("chief", "product", "Please report when finished")])
+    handle_hook(store, "product", {
+        "hook_event_name": "Stop", "last_assistant_message": "Acknowledged. I will proceed."
+    })
+    assert store.inbox("chief") == []
 
 
 def test_permission_and_failure_states(store):

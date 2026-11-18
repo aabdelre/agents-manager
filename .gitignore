@@ -6,4 +6,5 @@ __pycache__/
 .demo/
 .test-state/
 .test-state-demo/
+.test-channels/
 dist/

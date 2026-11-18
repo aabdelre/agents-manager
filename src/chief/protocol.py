@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
+import threading
 import time
+import uuid
 
 from chief.store import Store
 from chief.tmux import Tmux
@@ -34,7 +37,8 @@ TOOLS = [
     ),
     tool(
         "send",
-        "Send a durable instruction. Agents may send to chief; chief may send to any workstream.",
+        "Prompt another session directly, even when idle. Agents may send to chief; chief may send to any "
+        "workstream. Delivery starts a turn automatically. Messages are also saved in the inbox.",
         {"to": STRING, "message": STRING},
         ("to", "message"),
     ),
@@ -64,7 +68,7 @@ TOOLS = [
     ),
     tool(
         "report",
-        "Publish a concise progress report to chief and update the sidebar. Todos are HUMAN actions.",
+        "Prompt chief directly with a concise progress report and update the sidebar. Todos are HUMAN actions.",
         {
             "summary": STRING,
             "next_step": STRING,
@@ -84,11 +88,16 @@ TOOLS = [
 
 
 class Protocol:
-    def __init__(self, store: Store, identity):
+    def __init__(self, store: Store, identity, *, channel=False):
         self.store = store
         self.identity = identity
         self.row = store.session(identity)
         self.tmux = Tmux(store)
+        self.channel = channel
+        self.channel_token = str(uuid.uuid4())
+        self.ready = threading.Event()
+        self.closed = threading.Event()
+        self.output_lock = threading.Lock()
 
     def chief_only(self):
         if self.row["role"] != "chief":
@@ -149,6 +158,11 @@ class Protocol:
             return self.store.inbox(self.identity)
         if name == "await_updates":
             self.chief_only()
+            if self.channel:
+                return {
+                    "messages": self.store.inbox(self.identity),
+                    "status": "Direct delivery is active. New messages will prompt you automatically.",
+                }
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 messages = self.store.deliver(self.identity)
@@ -176,6 +190,8 @@ class Protocol:
         if not isinstance(request, dict):
             return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid request"}}
         if "id" not in request:
+            if request.get("method") == "notifications/initialized":
+                self.ready.set()
             return None
         response = {"jsonrpc": "2.0", "id": request["id"]}
         method = request.get("method")
@@ -187,6 +203,14 @@ class Protocol:
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "chief", "version": "0.1.0"},
             }
+            if self.channel:
+                response["result"]["capabilities"]["experimental"] = {"claude/channel": {}}
+                response["result"]["instructions"] = (
+                    'Messages from the local chief or workstreams arrive as <channel source="chief"> events. '
+                    "Read and act on the message directly, then ack its message_id. Use send to prompt the "
+                    "other session or report to update chief. Delivery is automatic; never ask the user to "
+                    "check an inbox. Reports need no courtesy reply. Respect existing tool permissions."
+                )
         elif method == "ping":
             response["result"] = {}
         elif method == "tools/list":
@@ -194,6 +218,7 @@ class Protocol:
                 "tools": [
                     t
                     for t in TOOLS
+                    if not (self.channel and t["name"] == "await_updates")
                     if self.identity == "chief"
                     or t["name"] not in {"spawn", "probe", "inspect", "await_updates"}
                 ]
@@ -211,11 +236,62 @@ class Protocol:
             response["error"] = {"code": -32601, "message": "Method not found"}
         return response
 
-    def serve(self):
-        for line in sys.stdin:
+    def emit(self, message):
+        # Tool responses and asynchronous pushes share the same JSON-lines transport.
+        with self.output_lock:
+            print(json.dumps(message, ensure_ascii=False), flush=True)
+
+    def push_pending(self):
+        if not self.channel or not self.ready.is_set():
+            return 0
+        messages = self.store.deliver(self.identity, channel_token=self.channel_token)
+        for message in messages:
+            self.emit(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/claude/channel",
+                    "params": {
+                        "content": f"Message #{message['id']} from {message['sender']} ({message['kind']}):\n"
+                        f"{message['body']}\n\nAcknowledge message #{message['id']} with ack, then act on it.",
+                        "meta": {
+                            "message_id": str(message["id"]),
+                            "sender": message["sender"],
+                            "kind": message["kind"],
+                            "recipient": self.identity,
+                        },
+                    },
+                }
+            )
+        return len(messages)
+
+    def publish(self):
+        while not self.closed.wait(0.2):
             try:
-                response = self.dispatch(json.loads(line))
-            except (json.JSONDecodeError, TypeError):
-                response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
-            if response is not None:
-                print(json.dumps(response), flush=True)
+                self.push_pending()
+            except sqlite3.OperationalError:
+                continue  # Retry transient database locks without dropping the bridge.
+            except (BrokenPipeError, OSError):
+                self.closed.set()
+                return  # The next connection replays unacknowledged messages.
+
+    def serve(self):
+        publisher = None
+        if self.channel:
+            publisher = threading.Thread(target=self.publish, daemon=True)
+            publisher.start()
+        try:
+            for line in sys.stdin:
+                try:
+                    response = self.dispatch(json.loads(line))
+                except (json.JSONDecodeError, TypeError):
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": "Parse error"},
+                    }
+                if response is not None:
+                    self.emit(response)
+        finally:
+            self.closed.set()
+            if publisher:
+                publisher.join(timeout=1)

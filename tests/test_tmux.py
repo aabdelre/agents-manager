@@ -94,11 +94,17 @@ def test_real_tmux_sessions_persist_and_exchange_messages(tmp_path):
                 tmux.stop(row["name"])
 
 
-def test_safe_wake_does_not_touch_user_drafts(store, monkeypatch):
-    tmux = Tmux(store)
+def test_direct_delivery_does_not_type_into_visited_sessions(store, monkeypatch):
+    from chief.protocol import Protocol
+
+    protocol = Protocol(store, "product", channel=True)
     store.update("product", state="idle", attended=1)
     store.send("chief", "product", "New task")
     monkeypatch.setattr(
-        tmux, "run", lambda *args, **kwargs: pytest.fail("Must not type into a visited session")
+        protocol.tmux, "run", lambda *args, **kwargs: pytest.fail("Delivery must not touch terminal input")
     )
-    assert tmux.wake_if_safe("product") is False
+    emitted = []
+    monkeypatch.setattr(protocol, "emit", emitted.append)
+    protocol.ready.set()
+    assert protocol.push_pending() == 1
+    assert emitted[0]["method"] == "notifications/claude/channel"
