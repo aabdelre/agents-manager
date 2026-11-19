@@ -56,6 +56,27 @@ def test_real_tmux_sessions_persist_and_exchange_messages(tmp_path):
                     return
             pytest.fail("Attached tmux client did not navigate as expected")
 
+        def click_session(current, target):
+            sidebar = store.session(current)["sidebar"]
+            lines = tmux.run("capture-pane", "-p", "-t", sidebar).splitlines()
+            matching_rows = [index for index, line in enumerate(lines) if line.split()[-1:] == [target]]
+            assert matching_rows, "\n".join(lines)
+            row = matching_rows[0]
+            left, top = map(
+                int, tmux.run("display-message", "-p", "-t", sidebar, "#{pane_left} #{pane_top}").split()
+            )
+            # Start with Claude focused: the first click must both focus the
+            # sidebar and open the requested session, without a second click.
+            tmux.run("select-pane", "-t", store.session(current)["pane"])
+            x, y = left + 6, top + row + 1
+            os.write(master, f"\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m".encode())
+            wait_for(lambda: bool(tmux.attached(target)))
+            wait_for(
+                lambda: (
+                    f"◆ {target}" in tmux.run("capture-pane", "-p", "-t", store.session(target)["sidebar"])
+                )
+            )
+
         try:
             wait_for(lambda: bool(tmux.attached("chief")))
             client_name = tmux.attached("chief")[0]
@@ -74,6 +95,14 @@ def test_real_tmux_sessions_persist_and_exchange_messages(tmp_path):
             wait_for(lambda: bool(tmux.attached("chief")))
             os.write(master, b"\x1b[1;3C")
             wait_for(lambda: bool(tmux.attached("research")))
+            # Round trips revisit existing sidebar processes, where the old
+            # implementation left the highlight on the last session clicked.
+            click_session("research", "chief")
+            click_session("chief", "research")
+            click_session("research", "chief")
+            os.write(master, b"\x1b[1;3C")
+            wait_for(lambda: bool(tmux.attached("research")))
+            click_session("research", "chief")
         finally:
             os.close(master)
             os.close(slave)

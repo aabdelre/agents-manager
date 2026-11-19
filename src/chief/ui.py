@@ -12,6 +12,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, ListItem, ListView, Static, TextArea
 
+from chief.avatar import ChiefAvatar
 from chief.store import Store
 from chief.tmux import Tmux
 
@@ -25,6 +26,42 @@ COLORS = {
     "exited": "#75849b",
     "stopped": "#75849b",
 }
+
+
+class SessionItem(ListItem):
+    """Keep the click destination on the row, independent of the list cursor."""
+
+    def __init__(self, row, current):
+        self.session_name = row["name"]
+        self.label = Label()
+        super().__init__(self.label)
+        self.update_session(row, current)
+
+    def update_session(self, row, current):
+        active = self.session_name == current
+        self.set_class(active, "-active")
+        label = Text("◆ " if active else "  ", style="#7de0bb")
+        label.append(self.session_name, style="bold #e7eef8" if active else "#b4c5db")
+        label.append("\n  ● ", style=COLORS.get(row["state"], "white"))
+        label.append(row["state"], style="#91a7c3")
+        if row["unread"]:
+            label.append(f" · {row['unread']} unread", style="#eac28e")
+        self.label.update(label)
+
+
+class SessionList(ListView):
+    def __init__(self, current):
+        super().__init__(id="sessions", initial_index=None)
+        self.current = current
+
+    def reset_cursor(self):
+        self.index = next(
+            (index for index, item in enumerate(self.children) if item.session_name == self.current),
+            None,
+        )
+
+    def on_blur(self):
+        self.reset_cursor()
 
 
 class NewWorkstream(ModalScreen):
@@ -109,12 +146,17 @@ class Sidebar(App):
     CSS = """
     Screen { background: #0e1726; color: #d6e2f3; }
     #brand { height: 2; padding: 0 1; color: #88a2c4; text-style: bold; }
-    #avatar { height: 8; content-align: center middle; color: #eac28e; background: #172335; }
+    #avatar { height: 8; content-align: center middle; background: #172335; }
     #portfolio { height: 2; content-align: center middle; color: #91a7c3; }
     .eyebrow { height: 2; padding: 1 1 0 1; color: #7de0bb; text-style: bold; }
     #sessions { height: auto; max-height: 10; min-height: 3; background: #0e1726; margin: 0 1; }
-    #sessions ListItem { height: 2; padding: 0 1; }
-    #sessions ListItem.--highlight { background: #25384b; }
+    #sessions ListItem { height: 2; padding: 0 1; border-left: solid #0e1726; }
+    #sessions ListItem.-highlight { background: #0e1726; text-style: none; }
+    #sessions ListItem.-hovered { background: #1b2b3e; }
+    #sessions:focus ListItem.-highlight { background: #1b2b3e; text-style: underline; }
+    #sessions ListItem.-active, #sessions:focus ListItem.-active {
+        background: #253d4b; border-left: solid #7de0bb; text-style: none;
+    }
     #summary { height: auto; max-height: 6; padding: 1 2; color: #a9bad1; }
     #todos { height: 1fr; min-height: 3; padding: 0 1; }
     #todos Checkbox { width: 100%; height: auto; min-height: 2; background: #0e1726; border: none; padding: 0 1; }
@@ -142,17 +184,13 @@ class Sidebar(App):
         self.tmux = Tmux(store)
         self.last_sessions = None
         self.last_todos = None
-        self.names = []
 
     def compose(self) -> ComposeResult:
         yield Static("C / S       CHIEF OF STAFF", id="brand")
-        yield Static(
-            "     ╭─────────╮\n     │  ◕   ◕  │\n     │    ─    │\n     ╰────┬────╯\n       ╱ ▰ ╲\n\nTHE CHIEF  ·  your command desk",
-            id="avatar",
-        )
+        yield ChiefAvatar()
         yield Static("Connecting your workstreams…", id="portfolio")
         yield Static("OPEN SESSIONS", classes="eyebrow")
-        yield ListView(id="sessions")
+        yield SessionList(self.session_name)
         yield Static("", id="summary")
         yield Static("YOUR NEXT MOVES", classes="eyebrow")
         yield VerticalScroll(id="todos")
@@ -183,27 +221,31 @@ class Sidebar(App):
 
     async def refresh_data(self):
         rows = self.store.sessions()
-        self.names = [r["name"] for r in rows]
         signature = [(r["name"], r["state"], r["unread"]) for r in rows]
         if signature != self.last_sessions:
-            listing = self.query_one("#sessions", ListView)
-            old_index = listing.index
-            await listing.clear()
-            for row in rows:
-                label = Text(
-                    "◆ " if row["name"] == self.session_name else "○ ",
-                    style=COLORS.get(row["state"], "white"),
-                )
-                label.append(row["name"], style="bold" if row["name"] == self.session_name else "")
-                label.append(f"  {row['state']}", style="#91a7c3")
-                if row["unread"]:
-                    label.append(f"  {row['unread']}✉", style="#eac28e")
-                await listing.append(ListItem(Label(label)))
-            listing.index = (
-                old_index
-                if old_index is not None and old_index < len(rows)
-                else self.names.index(self.session_name)
-            )
+            listing = self.query_one("#sessions", SessionList)
+            items = {item.session_name: item for item in listing.children}
+            names = [row["name"] for row in rows]
+            membership_changed = list(items) != names
+            cursor = listing.highlighted_child
+            if membership_changed:
+                listing.index = None
+                await listing.remove_children([item for name, item in items.items() if name not in names])
+            for index, row in enumerate(rows):
+                item = items.get(row["name"])
+                if item is None:
+                    item = SessionItem(row, self.session_name)
+                    await listing.append(item)
+                else:
+                    # Status updates must not unmount a row between mouse-down and mouse-up.
+                    item.update_session(row, self.session_name)
+                if membership_changed:
+                    listing.move_child(item, before=index)
+            if membership_changed:
+                if cursor is not None and cursor.session_name in names and listing.has_focus:
+                    listing.index = names.index(cursor.session_name)
+                else:
+                    listing.reset_cursor()
             self.last_sessions = signature
         workers = [r for r in rows if r["role"] == "agent"]
         working = sum(r["state"] in {"working", "waking"} for r in workers)
@@ -236,9 +278,17 @@ class Sidebar(App):
 
     @on(ListView.Selected, "#sessions")
     def select_session(self, event):
-        if event.list_view.index is not None:
-            target = self.names[event.list_view.index]
+        if isinstance(event.item, SessionItem):
+            self.navigate(event.item.session_name)
+
+    def navigate(self, target=None, *, direction=1):
+        if target is None:
+            self.guarded(lambda: self.tmux.navigate(self.session_name, direction=direction))
+        else:
             self.guarded(lambda: self.tmux.navigate(self.session_name, target))
+        # Every tmux session owns its sidebar. Leave this one pointing at its own
+        # session, so returning via a click, arrow, or tmux never shows a stale cursor.
+        self.query_one("#sessions", SessionList).reset_cursor()
 
     @on(Checkbox.Changed)
     def complete_todo(self, event):
@@ -260,7 +310,7 @@ class Sidebar(App):
             "previous": self.action_previous,
             "next": self.action_next,
             "new": self.action_new,
-            "chief": lambda: self.guarded(lambda: self.tmux.navigate(self.session_name, "chief")),
+            "chief": lambda: self.navigate("chief"),
             "probe": self.probe,
             "inbox": self.inbox,
         }
@@ -268,10 +318,10 @@ class Sidebar(App):
             actions[event.button.id]()
 
     def action_previous(self):
-        self.guarded(lambda: self.tmux.navigate(self.session_name, direction=-1))
+        self.navigate(direction=-1)
 
     def action_next(self):
-        self.guarded(lambda: self.tmux.navigate(self.session_name, direction=1))
+        self.navigate(direction=1)
 
     def action_focus_claude(self):
         self.guarded(

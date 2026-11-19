@@ -48,6 +48,10 @@ pause at permission or trust prompts. Open that workstream to respond.
 | **Inbox** | Read this session's queued and unacknowledged messages |
 | Check an action item | Mark your action complete |
 
+The open session has a mint rail and **◆** marker. One click anywhere on a session row
+opens it; the marker stays tied to the session you are viewing through status updates
+and return visits. Keyboard focus has a separate, subtle underline until you press Enter.
+
 If your terminal reserves Option/Alt+arrows, use the clickable controls or configure Option
 to send Escape/Meta. With multiple terminals attached to the same session, use Alt+arrows;
 the sidebar avoids guessing which terminal to switch.
